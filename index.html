@@ -54,6 +54,9 @@ a{color:inherit}
 .gate-title{font-size:27px;letter-spacing:.14em;margin:0 0 4px;font-weight:700;padding-left:.14em}
 .gate-lead{color:var(--muted);max-width:26em;margin:0 0 22px;font-size:14.5px}
 .gate-form{width:100%;max-width:380px;display:flex;flex-direction:column;gap:12px;text-align:left}
+.bio-btn .ic{width:24px;height:24px;stroke-width:1.7}
+.or{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:12.5px;margin:4px 0 -2px}
+.or::before,.or::after{content:"";flex:1;height:1px;background:var(--line)}
 .linkbtn{margin-top:22px;color:var(--muted);font-size:13.5px;text-decoration:underline;text-underline-offset:3px;padding:8px}
 .caution{display:flex;gap:10px;background:var(--warn-soft);color:var(--ink);border-radius:14px;padding:12px 14px;font-size:13.5px;line-height:1.65}
 .caution .ic{color:var(--warn);margin-top:2px}
@@ -249,6 +252,11 @@ textarea.inp{resize:vertical;min-height:84px;line-height:1.6}
 .switch input:focus-visible+.sw{outline:2px solid var(--ai-ink);outline-offset:2px}
 
 .set{margin-bottom:24px}
+.set-switch{background:var(--surface-2);border-radius:14px;padding:10px 14px;margin-bottom:4px;min-height:60px}
+.set-switch>.ic{color:var(--ai-ink)}
+.sw-text{flex:1;display:flex;flex-direction:column;line-height:1.45}
+.sw-text small{color:var(--muted);font-size:12.5px}
+.switch input:disabled~.sw{opacity:.4}
 .set h3{font-size:14px;color:var(--muted);margin:0 0 8px;font-weight:700}
 .set-label{font-size:14px;margin:12px 0 8px}
 .set-note{font-size:13px;color:var(--muted);margin:6px 0 0;line-height:1.7}
@@ -344,6 +352,7 @@ const I = {
   check:'<path d="M5 12.5l4.5 4.5L19 7"/>',
   chev:'<path d="M9 6l6 6-6 6"/>',
   dice:'<rect x="4" y="4" width="16" height="16" rx="3.5"/><circle cx="9" cy="9" r="1.1" class="fill"/><circle cx="15" cy="15" r="1.1" class="fill"/><circle cx="15" cy="9" r="1.1" class="fill"/><circle cx="9" cy="15" r="1.1" class="fill"/>',
+  finger:'<path d="M6.3 7.4A7 7 0 0 1 19 11.5v1"/><path d="M5 11.5c0 1.6-.3 3-.8 4.2"/><path d="M8.6 20c1-1.9 1.6-4.3 1.6-7v-1.4a1.8 1.8 0 0 1 3.6 0V13c0 3.2-.6 5.8-1.8 7.8"/><path d="M7.9 11.6a4.1 4.1 0 0 1 8.2 0V13c0 2.2-.3 4.2-.8 5.8"/><path d="M18.8 15.6c-.2 1.2-.5 2.4-.9 3.4"/>',
   shield:'<path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path d="M9 12l2 2 4-4"/>'
 };
 const ic = (n, c = '') => `<svg class="ic ${c}" viewBox="0 0 24 24" aria-hidden="true">${I[n] || ''}</svg>`;
@@ -426,6 +435,81 @@ async function unseal(key, iv, ct) {
   const pt = await crypto.subtle.decrypt({ name:'AES-GCM', iv: unb64(iv) }, key, unb64(ct));
   return JSON.parse(td.decode(pt));
 }
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
+async function sealBytes(key, bytes) {
+  const iv = rand(12);
+  return { iv: b64(iv), ct: b64(await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, bytes)) };
+}
+async function unsealBytes(key, iv, ct) {
+  return new Uint8Array(await crypto.subtle.decrypt({ name:'AES-GCM', iv: unb64(iv) }, key, unb64(ct)));
+}
+/* 金庫の鍵（ランダム）を、マスターパスワードと指紋の2通りで包んでおく */
+const importDek = raw => crypto.subtle.importKey('raw', raw, { name:'AES-GCM' }, true, ['encrypt', 'decrypt']);
+const newDek = () => crypto.subtle.generateKey({ name:'AES-GCM', length:256 }, true, ['encrypt', 'decrypt']);
+const rawDek = async dek => new Uint8Array(await crypto.subtle.exportKey('raw', dek));
+async function wrapWithPassword(pw, dek) {
+  const salt = rand(16), k = await deriveKey(pw, salt, ITER);
+  return { salt, iter: ITER, wrapPw: await sealBytes(k, await rawDek(dek)) };
+}
+// 保存データ・バックアップをマスターパスワードで開く（旧形式 v1 は自動で新形式へ）
+async function openWithPassword(env, pw) {
+  const salt = unb64(env.salt), k = await deriveKey(pw, salt, env.iter);
+  if (env.wrapPw) {
+    const dek = await importDek(await unsealBytes(k, env.wrapPw.iv, env.wrapPw.ct));
+    return { dek, salt, iter: env.iter, wrapPw: env.wrapPw, data: await unseal(dek, env.iv, env.ct) };
+  }
+  const data = await unseal(k, env.iv, env.ct), dek = await newDek();
+  return { dek, salt, iter: env.iter, wrapPw: await sealBytes(k, await rawDek(dek)), data, migrated: true };
+}
+
+/* ---------- 指紋・顔認証（パスキー + PRF） ---------- */
+async function bioSupported() {
+  try {
+    if (!window.PublicKeyCredential || !PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) return false;
+    if (!(await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable())) return false;
+    if (PublicKeyCredential.getClientCapabilities) {
+      const c = await PublicKeyCredential.getClientCapabilities();
+      if (c && c['extension:prf'] === false) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+const prfError = () => Object.assign(new Error('PRF not available'), { name:'PrfUnsupported' });
+async function bioKek(prfOut) {
+  const base = await crypto.subtle.importKey('raw', prfOut, 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name:'HKDF', hash:'SHA-256', salt: te.encode('kagibako-bio-v1'), info: te.encode('vault-key') }, base, { name:'AES-GCM', length:256 }, false, ['encrypt', 'decrypt']);
+}
+async function bioEval(bio) {
+  const a = await navigator.credentials.get({ publicKey: {
+    challenge: rand(32), rpId: bio.rpId, userVerification:'required', timeout:120000,
+    allowCredentials: [{ type:'public-key', id: unb64(bio.credId), transports:['internal'] }],
+    extensions: { prf: { eval: { first: unb64(bio.prfSalt) } } } } });
+  const r = a.getClientExtensionResults() || {};
+  const out = r.prf && r.prf.results && r.prf.results.first;
+  if (!out) throw prfError();
+  return out;
+}
+async function bioEnroll(dek, userId) {
+  const prfSalt = rand(32), rpId = location.hostname;
+  const cred = await navigator.credentials.create({ publicKey: {
+    challenge: rand(32), rp: { name:'かぎ箱', id: rpId },
+    user: { id: userId, name:'かぎ箱', displayName:'かぎ箱' },
+    pubKeyCredParams: [{ type:'public-key', alg:-7 }, { type:'public-key', alg:-257 }],
+    authenticatorSelection: { authenticatorAttachment:'platform', residentKey:'required', requireResidentKey:true, userVerification:'required' },
+    timeout:120000, attestation:'none', extensions: { prf: { eval: { first: prfSalt } } } } });
+  const ext = cred.getClientExtensionResults() || {};
+  if (!ext.prf || ext.prf.enabled === false) throw prfError();
+  const bio = { rpId, credId: b64(new Uint8Array(cred.rawId)), prfSalt: b64(prfSalt), created: Date.now() };
+  const out = (ext.prf.results && ext.prf.results.first) || await bioEval(bio);
+  const w = await sealBytes(await bioKek(out), await rawDek(dek));
+  return Object.assign(bio, w);
+}
+async function bioOpen(env) {
+  const kek = await bioKek(await bioEval(env.bio));
+  const dek = await importDek(await unsealBytes(kek, env.bio.iv, env.bio.ct));
+  return { dek, data: await unseal(dek, env.iv, env.ct) };
+}
+
 function loadEnv() {
   try { const e = JSON.parse(localStorage.getItem(STORE)); return e && e.app === 'kagibako' && e.ct && e.salt ? e : null; } catch { return null; }
 }
@@ -469,7 +553,7 @@ function setMeter(el, pw) {
 const pwField = (id, label, ph = '', ac = 'off') => `<label class="field"><span class="field-label">${label}</span><span class="pw-wrap"><input id="${id}" type="password" autocomplete="${ac}" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="${esc(ph)}"><button type="button" class="eye" data-eye="${id}" aria-label="表示する">${ic('eye')}</button></span></label>`;
 
 /* ---------- 状態 ---------- */
-const S = { key:null, salt:null, iter:ITER, data:null, q:'', filter:'all', hold:0 };
+const S = { key:null, salt:null, iter:ITER, wrapPw:null, bio:null, data:null, q:'', filter:'all', hold:0 };
 let lastAct = Date.now(), clipTimer = null, clipPending = false, saveChain = Promise.resolve(), waitTimer = null;
 const GEN_DEFAULT = { len:16, upper:true, lower:true, digit:true, symbol:true, noAmb:true };
 function withDefaults(d) {
@@ -484,10 +568,12 @@ const find = id => S.data && S.data.items.find(i => i.id === id);
 
 function save() {
   if (!S.key) return saveChain;
-  const key = S.key, salt = S.salt, iter = S.iter, snap = JSON.stringify(S.data);
+  const key = S.key, salt = S.salt, iter = S.iter, wrapPw = S.wrapPw, bio = S.bio, snap = JSON.stringify(S.data);
   saveChain = saveChain.then(async () => {
     const { iv, ct } = await seal(key, snap);
-    localStorage.setItem(STORE, JSON.stringify({ app:'kagibako', v:1, salt:b64(salt), iter, iv, ct, saved:Date.now() }));
+    const env = { app:'kagibako', v:2, salt:b64(salt), iter, wrapPw, iv, ct, saved:Date.now() };
+    if (bio) env.bio = bio;
+    localStorage.setItem(STORE, JSON.stringify(env));
   }).catch(e => {
     console.error(e);
     toast('保存できませんでした', { kind:'error', sub: e && e.name === 'QuotaExceededError' ? '端末の保存容量がいっぱいです' : String(e && e.message || e) });
@@ -643,11 +729,14 @@ async function copyText(text, label, item, btn) {
   toast(`${label}をコピーしました`, { sub: sec > 0 ? `${sec}秒後にクリップボードから消します` : '' });
 }
 
+function setVault(o) { S.key = o.dek; S.salt = o.salt; S.iter = o.iter; S.wrapPw = o.wrapPw; S.bio = o.bio || null; S.data = withDefaults(o.data); }
+function clearVault() { S.key = null; S.data = null; S.salt = null; S.wrapPw = null; S.bio = null; }
+
 /* =========================================================
    入口：はじめての作成 / ロック解除
    ========================================================= */
 function showSetup() {
-  S.key = null; S.data = null; S.salt = null;
+  clearVault();
   $('#app').innerHTML = `<main class="gate">
     <div class="emblem" id="emblem">${EMBLEM}</div>
     <h1 class="gate-title">かぎ箱</h1>
@@ -680,13 +769,13 @@ function showSetup() {
     }
     btn.disabled = true; btn.textContent = '作っています…';
     try {
-      S.salt = crypto.getRandomValues(new Uint8Array(16)); S.iter = ITER;
-      S.key = await deriveKey(m1.value, S.salt, S.iter);
-      S.data = withDefaults({ created: Date.now() });
+      const dek = await newDek(), w = await wrapWithPassword(m1.value, dek);
+      setVault({ dek, ...w, data: { created: Date.now() } });
       await save();
       if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
       $('#emblem').classList.add('turn'); await sleep(reduced ? 0 : 450);
       enterMain(); toast('金庫を作りました');
+      offerBio();
     } catch (e) { btn.disabled = false; btn.textContent = 'この金庫を作る'; toast('作れませんでした', { kind:'error', sub:String(e.message || e) }); }
   };
   $('#restore').onclick = importBackup;
@@ -703,15 +792,20 @@ function applyWait() {
   };
   tick(); waitTimer = setInterval(tick, 500);
 }
-function showLock(msg) {
+function showLock(msg, auto) {
+  const env = loadEnv();
+  const bioOk = !!(env && env.bio && env.bio.rpId === location.hostname && window.PublicKeyCredential);
+  const bioMoved = !!(env && env.bio && !bioOk && env.bio.rpId !== location.hostname);
   $('#app').innerHTML = `<main class="gate">
     <div class="emblem" id="emblem">${EMBLEM}</div>
     <h1 class="gate-title">かぎ箱</h1>
-    <p class="gate-lead">${msg ? esc(msg) : 'マスターパスワードを入れて開けてください。'}</p>
+    <p class="gate-lead">${msg ? esc(msg) : bioOk ? '指紋・顔認証か、マスターパスワードで開けてください。' : 'マスターパスワードを入れて開けてください。'}</p>
     <div class="gate-form">
+      ${bioOk ? `<button class="btn primary big bio-btn" id="bioBtn">${ic('finger')}指紋・顔認証で開く</button><div class="or">またはマスターパスワード</div>` : ''}
       ${pwField('mp', 'マスターパスワード')}
       <p class="err" id="mpErr" role="alert"></p>
-      <button class="btn primary big" id="unlock">開ける</button>
+      <button class="btn ${bioOk ? 'ghost' : 'primary'} big" id="unlock">開ける</button>
+      ${bioMoved ? `<p class="set-note">アプリのアドレスが変わったため、指紋・顔認証は使えません。マスターパスワードで開いたあと、設定からもう一度オンにしてください。</p>` : ''}
     </div>
     <button class="linkbtn" id="forgot">マスターパスワードを忘れたとき</button>
   </main>`;
@@ -721,7 +815,29 @@ function showLock(msg) {
   btn.onclick = tryUnlock;
   $('#forgot').onclick = forgotFlow;
   applyWait();
-  setTimeout(() => mp.focus(), 80);
+  if (bioOk) {
+    $('#bioBtn').onclick = () => tryBio(false);
+    if (auto && !document.hidden) setTimeout(() => tryBio(true), 250);
+  } else setTimeout(() => mp.focus(), 80);
+}
+let bioBusy = false;
+async function tryBio(auto) {
+  const env = loadEnv(), btn = $('#bioBtn'), err = $('#mpErr');
+  if (!env || !env.bio || !btn || bioBusy) return;
+  bioBusy = true; btn.disabled = true; err.textContent = '';
+  try {
+    const o = await bioOpen(env);
+    setVault({ dek: o.dek, salt: unb64(env.salt), iter: env.iter, wrapPw: env.wrapPw, bio: env.bio, data: o.data });
+    localStorage.removeItem(FAILS);
+    $('#emblem').classList.add('turn'); await sleep(reduced ? 0 : 450);
+    enterMain();
+  } catch (e) {
+    console.warn(e);
+    if (!document.contains(btn)) return;
+    if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) { if (!auto) err.textContent = 'キャンセルされたか、登録したパスキーが見つかりませんでした。'; }
+    else if (e && e.name === 'OperationError') err.textContent = '指紋・顔認証の登録が古くなっています。マスターパスワードで開き、設定からオンにし直してください。';
+    else err.textContent = '指紋・顔認証で開けませんでした。マスターパスワードで開いてください。';
+  } finally { bioBusy = false; if (document.contains(btn)) btn.disabled = false; }
 }
 async function tryUnlock() {
   const mp = $('#mp'), btn = $('#unlock'), err = $('#mpErr');
@@ -730,9 +846,9 @@ async function tryUnlock() {
   const env = loadEnv(); if (!env) { showSetup(); return; }
   btn.disabled = true; btn.textContent = '開けています…';
   try {
-    const salt = unb64(env.salt), key = await deriveKey(mp.value, salt, env.iter);
-    const data = await unseal(key, env.iv, env.ct);
-    S.key = key; S.salt = salt; S.iter = env.iter; S.data = withDefaults(data);
+    const o = await openWithPassword(env, mp.value);
+    setVault({ ...o, bio: env.bio });
+    if (o.migrated) await save();
     localStorage.removeItem(FAILS);
     mp.value = '';
     $('#emblem').classList.add('turn'); await sleep(reduced ? 0 : 450);
@@ -756,18 +872,18 @@ async function forgotFlow() {
 async function wipe() {
   await saveChain;
   localStorage.removeItem(STORE); localStorage.removeItem(FAILS);
-  S.key = null; S.data = null; S.salt = null;
+  clearVault();
   if (sheetOpen) { sheetOpen = false; sheetGuard = null; hideSheet(true); history.back(); }
   showSetup(); toast('すべて消しました');
 }
-function lock(msg) {
+function lock(msg, auto) {
   if (!S.key) return;
   clearClip();
-  S.key = null; S.data = null; S.salt = null;
+  clearVault();
   if (dlg) dlg.finish(dlg.cancel);
   if (sheetOpen) { sheetOpen = false; sheetGuard = null; hideSheet(true); history.back(); }
   document.body.classList.remove('veil');
-  showLock(msg);
+  showLock(msg, auto);
 }
 
 /* =========================================================
@@ -1055,6 +1171,7 @@ function openSettings() {
     <div class="d-head"><h2 class="e-title">設定</h2><button class="icon-btn" data-sheet-close aria-label="閉じる">${ic('close')}</button></div>
     <section class="set">
       <h3>ロック</h3>
+      <div id="bioRow"></div>
       <p class="set-label">操作しないまま、この時間がたつと自動でロック</p>
       ${seg('autolock', [[1, '1分'], [3, '3分'], [5, '5分'], [15, '15分'], [30, '30分']], st.autolock)}
       <p class="set-label">コピーしたものをクリップボードから消すまで</p>
@@ -1077,6 +1194,7 @@ function openSettings() {
       <h3>このアプリのしくみ</h3>
       <ul class="facts">
         <li>中身はマスターパスワードから作った鍵（PBKDF2・60万回）でAES-256暗号化し、この端末のブラウザの中にだけ保存しています。</li>
+        <li>指紋・顔認証をオンにすると、端末のパスキーから作った別の鍵でも同じ金庫の鍵を包みます。指紋や顔の情報がアプリに渡ることはありません。</li>
         <li>通信は一切しません。外への送信はページの設定（CSP）で止めています。</li>
         <li>ブラウザの「サイトデータを削除」をすると中身も消えます。バックアップを忘れずに。</li>
       </ul>
@@ -1091,6 +1209,7 @@ function openSettings() {
       save();
     });
     $('#sChange', body).onclick = openChangeMaster;
+    renderBioRow(body);
     $('#sBackup', body).onclick = async () => { if (await exportBackup()) openSettings(); };
     $('#sRestore', body).onclick = importBackup;
     $('#sCsvIn', body).onclick = importCSV;
@@ -1100,6 +1219,64 @@ function openSettings() {
       if (t != null) wipe();
     };
   });
+}
+
+/* ---------- 指紋・顔認証の設定 ---------- */
+async function renderBioRow(body) {
+  const row = $('#bioRow', body); if (!row) return;
+  const ok = await bioSupported();
+  if (!document.contains(row) || !S.data) return;
+  const on = !!S.bio && S.bio.rpId === location.hostname;
+  const sub = on ? `オン（${fmtDate(S.bio.created)}に登録）` : ok ? 'マスターパスワードを入れずに開けます' : 'この端末・ブラウザでは使えません';
+  row.innerHTML = `<label class="switch set-switch">${ic('finger')}<span class="sw-text">指紋・顔認証で開く<small>${sub}</small></span><input type="checkbox" id="sBio" ${on ? 'checked' : ''} ${ok || on ? '' : 'disabled'}><span class="sw"></span></label>`;
+  $('#sBio', row).onchange = async e => {
+    const cb = e.target; cb.disabled = true;
+    if (cb.checked) await enableBio(false); else await disableBio();
+    if (!S.data) return;
+    if (document.contains(row)) renderBioRow(body);
+  };
+}
+async function verifyMaster(title) {
+  let error = '';
+  for (;;) {
+    const pw = await askInput({ title, message:'確認のため、マスターパスワードを入れてください。', type:'password', okLabel:'次へ', error });
+    if (pw == null) return false;
+    if (await checkPw(pw)) return true;
+    error = 'マスターパスワードが違います';
+  }
+}
+async function checkPw(pw) {
+  try { const k = await deriveKey(pw, S.salt, S.iter); await unsealBytes(k, S.wrapPw.iv, S.wrapPw.ct); return true; } catch { return false; }
+}
+async function enableBio(skipVerify) {
+  if (!S.key) return false;
+  if (!skipVerify && !(await verifyMaster('指紋・顔認証をオンにします'))) return false;
+  if (!S.data.settings.bioUid) S.data.settings.bioUid = b64(rand(16));
+  S.hold++;
+  try {
+    S.bio = await bioEnroll(S.key, unb64(S.data.settings.bioUid));
+    await save();
+    toast('指紋・顔認証で開けるようにしました', { sub:'次にロックを外すときから使えます' });
+    return true;
+  } catch (e) {
+    console.warn(e);
+    if (e && (e.name === 'NotAllowedError' || e.name === 'AbortError')) toast('設定をやめました', { kind:'warn' });
+    else if (e && e.name === 'PrfUnsupported') await ask({ title:'この端末では使えません', message:'このブラウザは、指紋・顔認証から暗号の鍵を作る機能（PRF）に対応していません。Chromeを最新版にして、もう一度お試しください。', buttons:[{ label:'閉じる', value:true, kind:'primary' }] });
+    else if (e && e.name === 'SecurityError') await ask({ title:'このアドレスでは使えません', message:'指紋・顔認証は https のページ（GitHub Pages など）で使えます。', buttons:[{ label:'閉じる', value:true, kind:'primary' }] });
+    else toast('設定できませんでした', { kind:'error', sub: `${e && e.name}: ${e && e.message}` });
+    return false;
+  } finally { S.hold = Math.max(0, S.hold - 1); lastAct = Date.now(); }
+}
+async function disableBio() {
+  const ok = await ask({ title:'指紋・顔認証をオフにしますか？', message:'これからはマスターパスワードで開きます。Googleパスワードマネージャーに残るパスキー「かぎ箱」は、不要なら削除してかまいません。', buttons:[{ label:'やめる', value:false, cancel:true }, { label:'オフにする', value:true, kind:'primary danger' }] });
+  if (!ok || !S.data) return false;
+  S.bio = null; await save(); toast('指紋・顔認証をオフにしました');
+  return true;
+}
+async function offerBio() {
+  if (!(await bioSupported()) || !S.key || S.bio) return;
+  const y = await ask({ title:'指紋・顔認証でも開けるようにしますか？', message:'毎回マスターパスワードを入れなくても、指紋や顔で開けるようになります。<br><br><b>マスターパスワードは機種変更やバックアップの復元で必要になるので、忘れないようにしてください。</b>', buttons:[{ label:'あとで', value:false, cancel:true }, { label:'設定する', value:true, kind:'primary' }] });
+  if (y) enableBio(true);
 }
 
 function openChangeMaster() {
@@ -1125,12 +1302,11 @@ function openChangeMaster() {
       const btn = $('#cGo', body); btn.disabled = true; btn.textContent = '確かめています…';
       try {
         await saveChain;
-        const env = loadEnv(), k0 = await deriveKey(c0.value, unb64(env.salt), env.iter);
-        await unseal(k0, env.iv, env.ct);
+        await openWithPassword(loadEnv(), c0.value);
       } catch { err.textContent = '今のマスターパスワードが違います'; btn.disabled = false; btn.textContent = '変更する'; c0.select(); return; }
       btn.textContent = '変えています…';
-      const salt = crypto.getRandomValues(new Uint8Array(16));
-      S.key = await deriveKey(c1.value, salt, ITER); S.salt = salt; S.iter = ITER;
+      const w = await wrapWithPassword(c1.value, S.key);
+      S.salt = w.salt; S.iter = w.iter; S.wrapPw = w.wrapPw;
       await save();
       sheetGuard = null; openSettings();
       toast('マスターパスワードを変えました', { sub:'新しくバックアップを保存しておくと安心です' });
@@ -1144,7 +1320,7 @@ function openChangeMaster() {
 async function exportBackup() {
   if (!S.key) return false;
   const { iv, ct } = await seal(S.key, JSON.stringify(S.data));
-  const env = { app:'kagibako', kind:'backup', v:1, salt:b64(S.salt), iter:S.iter, iv, ct, exported:new Date().toISOString(), count:S.data.items.length };
+  const env = { app:'kagibako', kind:'backup', v:2, salt:b64(S.salt), iter:S.iter, wrapPw:S.wrapPw, iv, ct, exported:new Date().toISOString(), count:S.data.items.length };
   const ok = await deliver(new Blob([JSON.stringify(env)], { type:'application/json' }), `kagibako-backup-${ymd()}.json`, 'かぎ箱のバックアップ');
   if (!ok || !S.data) return false;
   S.data.lastBackup = Date.now(); S.data.settings.snooze = 0; save(); renderBanner();
@@ -1158,10 +1334,10 @@ async function openBackupEnv(env) {
     const pw = await askInput({ title:'バックアップを開きます', message:`${esc(when)}保存したときのマスターパスワードを入れてください。`, type:'password', okLabel:'開ける', error });
     if (pw == null) return null;
     try {
-      const salt = unb64(env.salt), key = await deriveKey(pw, salt, env.iter);
-      const data = withDefaults(await unseal(key, env.iv, env.ct));
-      data.lastBackup = Math.max(data.lastBackup || 0, Date.parse(env.exported) || 0);
-      return { key, salt, data };
+      const o = await openWithPassword(env, pw);
+      o.data = withDefaults(o.data);
+      o.data.lastBackup = Math.max(o.data.lastBackup || 0, Date.parse(env.exported) || 0);
+      return o;
     } catch { error = 'マスターパスワードが違います'; }
   }
 }
@@ -1174,11 +1350,12 @@ async function importBackup() {
   const opened = await openBackupEnv(env); if (!opened) return;
   if (!S.key) {
     // はじめての端末：バックアップをそのまま金庫にする
-    S.key = opened.key; S.salt = opened.salt; S.iter = env.iter; S.data = opened.data;
+    setVault({ ...opened, bio: null });
     await save();
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     enterMain();
     toast(`${S.data.items.length}件を復元しました`, { sub:'これからはバックアップしたときのマスターパスワードで開きます' });
+    offerBio();
     return;
   }
   const incoming = opened.data.items;
@@ -1289,14 +1466,14 @@ document.addEventListener('keydown', e => {
   }
 });
 ['pointerdown', 'keydown', 'input', 'wheel', 'touchstart'].forEach(t => addEventListener(t, () => { lastAct = Date.now(); }, { passive:true, capture:true }));
-function checkIdle() {
+function checkIdle(auto) {
   if (!S.key || S.hold > 0) return;
-  if (Date.now() - lastAct > S.data.settings.autolock * 60000) lock('しばらく操作がなかったのでロックしました。');
+  if (Date.now() - lastAct > S.data.settings.autolock * 60000) lock('しばらく操作がなかったのでロックしました。', auto);
 }
-setInterval(checkIdle, 5000);
+setInterval(() => checkIdle(false), 5000);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { if (S.key && !S.hold) document.body.classList.add('veil'); }
-  else { document.body.classList.remove('veil'); checkIdle(); }
+  else { document.body.classList.remove('veil'); checkIdle(true); }
 });
 
 function boot() {
@@ -1305,7 +1482,7 @@ function boot() {
     $('#app').innerHTML = `<main class="gate"><div class="emblem">${EMBLEM}</div><h1 class="gate-title">かぎ箱</h1><p class="gate-lead">このページは https:// で始まるアドレス（GitHub Pages など）から開いてください。暗号化の機能が使えないため、ここでは動きません。</p></main>`;
     return;
   }
-  loadEnv() ? showLock() : showSetup();
+  loadEnv() ? showLock(null, true) : showSetup();
 }
 boot();
 })();
